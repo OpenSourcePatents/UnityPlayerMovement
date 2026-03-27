@@ -20,6 +20,16 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] private float coyoteTime = 0.1f;
     [SerializeField] private float jumpBufferTime = 0.1f;
 
+    // slope handling
+    [Header("Slope & Ground")]
+    [SerializeField] private float groundStickMoving = -2f;
+    [SerializeField] private float groundStickIdle = -10f;
+    [SerializeField] private float maxSlopeAngle = 45f;
+
+    // sprint config
+    [Header("Sprint")]
+    [Range(0f, 1f)][SerializeField] private float runStrafeThreshold = 0.1f;
+
     // components
     private CharacterController controller;
     private PlayerInput input;
@@ -32,10 +42,17 @@ public class PlayerMovement : MonoBehaviour
     private float jumpTimer;
     private float coyoteTimer;
     private float jumpBufferTimer;
+
     // pause flag used to temporarily freeze horizontal movement e g during dialogue choices
     private bool movementPaused = false;
+    public bool IsMovementPaused
+    {
+        get => movementPaused;
+        private set => movementPaused = value;
+    }
 
-    [Range(0f, 1f)][SerializeField] private float runStrafeThreshold = 0.1f;
+    // cached air control speed to avoid redundant multiplications per frame
+    private float airControlSpeed;
 
     // public api
     public Vector3 CurrentVelocity { get; private set; }
@@ -52,19 +69,21 @@ public class PlayerMovement : MonoBehaviour
         controller = GetComponent<CharacterController>();
         input = GetComponent<PlayerInput>();
         stamina = GetComponent<PlayerStamina>();
+
+        // cache once rather than recomputing every frame
+        airControlSpeed = walkSpeed * airControl;
     }
 
     private void Update()
     {
         if (controller == null || !controller.enabled || input == null) return;
 
-        if (movementPaused)
+        if (IsMovementPaused)
         {
             // while paused keep vertical physics gravity but zero horizontal movement so
             // the player remains in an idle pose while animator can still run
             IsGrounded = controller.isGrounded;
 
-            // zero horizontal velocity
             velocity.x = 0f;
             velocity.z = 0f;
 
@@ -79,6 +98,7 @@ public class PlayerMovement : MonoBehaviour
             stamina?.SetSprinting(false, false);
             return;
         }
+
         IsGrounded = controller.isGrounded;
 
         // Normalize input to prevent faster diagonal movement
@@ -86,30 +106,23 @@ public class PlayerMovement : MonoBehaviour
 
         float horizontal = CurrentInput.x;
         float vertical = CurrentInput.y;
+        bool hasInput = horizontal != 0f || vertical != 0f;
+
         // only allow sprint when input asks for it and stamina permits it
         bool wantsRun = input.RunHeld && vertical > 0f && Mathf.Abs(horizontal) <= runStrafeThreshold;
-        // Ask stamina to sprint, but then read back the authoritative state from stamina.
-        // This prevents using a stale local `IsRunning` value when stamina depletes later
-        // in the frame (execution order differences between components).
-        stamina?.SetSprinting(wantsRun && (horizontal != 0f || vertical != 0f), input.RunHeld);
-        IsRunning = (stamina != null) ? stamina.IsSprinting : wantsRun;
 
-        // Defensive: if stamina is depleted this frame, ensure sprinting is stopped
-        // immediately so the player cannot continue running for another frame due
-        // to execution order between components.
-        if (stamina != null && stamina.StaminaPercent <= stamina.DepletedPercentThreshold)
-        {
-            stamina.SetSprinting(false, input.RunHeld);
-            IsRunning = false;
-        }
+        // Delegate sprint authority entirely to stamina. Do not add a secondary
+        // depletion check here -- stamina.SetSprinting already handles cutoff
+        // internally, so duplicating it causes double-stopping and potential
+        // one-frame desync between components.
+        stamina?.SetSprinting(wantsRun && hasInput, input.RunHeld);
+        IsRunning = (stamina != null) ? stamina.IsSprinting : wantsRun;
 
         if (IsGrounded)
         {
             coyoteTimer = coyoteTime;
-            // Use the stamina-backed run state to determine target speed so sprinting
-            // is disabled the moment stamina stops permitting it.
             targetSpeed = IsRunning ? runSpeed : walkSpeed;
-            if (horizontal == 0f && vertical == 0f) targetSpeed = 0f;
+            if (!hasInput) targetSpeed = 0f;
         }
         else
         {
@@ -121,13 +134,22 @@ public class PlayerMovement : MonoBehaviour
 
         // movement math
         Vector3 inputDir = Vector3.zero;
-        if (horizontal != 0f || vertical != 0f)
+        if (hasInput)
         {
             inputDir = (transform.right * horizontal + transform.forward * vertical).normalized;
         }
 
         if (IsGrounded)
         {
+            // Slope angle check -- stop movement on slopes steeper than maxSlopeAngle
+            // to prevent the player climbing geometry the CharacterController alone
+            // would otherwise allow them to slide up or walk on.
+            if (IsOnSteepSlope())
+            {
+                targetSpeed = 0f;
+                currentSpeed = 0f;
+            }
+
             Vector3 moveDir = inputDir;
             // preserve momentum when stopping
             if (inputDir == Vector3.zero && currentSpeed > 0.1f)
@@ -139,23 +161,18 @@ public class PlayerMovement : MonoBehaviour
 
             Vector3 moveVelocity = moveDir * currentSpeed;
 
-            // Prevent sliding down slopes by applying a stronger downward force when grounded
-            float groundStickForce = -2f;
-            if (inputDir == Vector3.zero)
-            {
-                groundStickForce = -10f; // Stick harder when not moving
-            }
-
+            // Use serialized ground stick values instead of magic numbers
+            float groundStickForce = hasInput ? groundStickMoving : groundStickIdle;
             velocity = new Vector3(moveVelocity.x, velocity.y < 0f ? groundStickForce : velocity.y, moveVelocity.z);
         }
         else
         {
-            // physics math
+            // physics math -- use cached airControlSpeed
             if (inputDir != Vector3.zero)
             {
                 Vector3 horizontalVel = new Vector3(velocity.x, 0f, velocity.z);
-                Vector3 targetVel = inputDir * Mathf.Max(horizontalVel.magnitude, walkSpeed * airControl);
-                Vector3 newHorizontal = Vector3.MoveTowards(horizontalVel, targetVel, walkSpeed * airControl * Time.deltaTime);
+                Vector3 targetVel = inputDir * Mathf.Max(horizontalVel.magnitude, airControlSpeed);
+                Vector3 newHorizontal = Vector3.MoveTowards(horizontalVel, targetVel, airControlSpeed * Time.deltaTime);
                 velocity.x = newHorizontal.x;
                 velocity.z = newHorizontal.z;
             }
@@ -173,7 +190,6 @@ public class PlayerMovement : MonoBehaviour
 
         if (input.ConsumeJump())
         {
-            // jump math
             jumpBufferTimer = jumpBufferTime;
         }
         else
@@ -195,23 +211,37 @@ public class PlayerMovement : MonoBehaviour
     }
 
     /// <summary>
-    /// pause horizontal movement used by dialogue system while choices are shown
-    /// vertical physics gravity will continue so the player does not teleport
+    /// Returns true if the surface directly below the player exceeds maxSlopeAngle.
+    /// Uses a short downward raycast from the controller's base.
+    /// </summary>
+    private bool IsOnSteepSlope()
+    {
+        Vector3 origin = transform.position + Vector3.up * 0.1f;
+        if (Physics.Raycast(origin, Vector3.down, out RaycastHit hit, controller.height * 0.5f + 0.3f))
+        {
+            float angle = Vector3.Angle(hit.normal, Vector3.up);
+            return angle > maxSlopeAngle;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Pause horizontal movement used by dialogue system while choices are shown.
+    /// Vertical physics gravity will continue so the player does not teleport.
     /// </summary>
     public void PauseMovement()
     {
-        movementPaused = true;
-        // stop horizontal velocity immediately
+        IsMovementPaused = true;
         velocity.x = 0f;
         velocity.z = 0f;
         currentSpeed = 0f;
     }
 
     /// <summary>
-    /// resume movement after a pause
+    /// Resume movement after a pause.
     /// </summary>
     public void ResumeMovement()
     {
-        movementPaused = false;
+        IsMovementPaused = false;
     }
 }
